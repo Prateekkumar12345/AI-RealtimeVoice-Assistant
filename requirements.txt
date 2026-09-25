@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+websockets
+selenium
+psutil
+python-dotenv
+httpx
+pymongo
+# Optional: only needed if you also want the old batch job (reconcile a recording after the fact)
+# sarvamai
