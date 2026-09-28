@@ -7,3 +7,4 @@ data/sessions/
 frontend/node_modules/
 frontend/dist/
 chrome_profile/
+bot_session/

@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from websockets.exceptions import ConnectionClosed
 
 import config
+from utils import chrome_login, session_vault
 from utils.meet_bot import GoogleMeetBot
 from utils.transcript_manager import TranscriptManager
 from utils.llm_extractor import FieldExtractor
@@ -170,6 +171,11 @@ def get_config():
         "llm_model": config.LLM_MODEL,
         "llm_provider_configured": _llm_provider_configured(),
         "mongo_configured": bool(config.MONGO_URI),
+        # Never includes the password: only whether one is set, plus what the
+        # session vault currently holds (email, cookie count, expiry).
+        "auto_login": config.AUTO_LOGIN,
+        "google_credentials_configured": chrome_login.credentials_configured(),
+        "session_vault": session_vault.status(),
     }
 
 
@@ -201,12 +207,11 @@ def stop_session(sid: str):
     session = _sessions.get(sid)
     if not session:
         raise HTTPException(404, "Session not found")
-    if session.status not in ("recording", "stopping"):
+    if session.status != "recording":
         raise HTTPException(400, f"Session is not recording (status={session.status})")
-    if session.status == "recording":
-        session.status = "stopping"
-        _persist(session)
-        _broadcast(session, {"type": "status", "status": "stopping"})
+    session.status = "stopping"
+    _persist(session)
+    _broadcast(session, {"type": "status", "status": "stopping"})
     threading.Thread(target=_stop_worker, args=(session,), daemon=True).start()
     return {"accepted": True}
 
@@ -318,7 +323,11 @@ async def _handle_sarvam_message(session, msg):
         if event == "transcript.partial":
             text = msg.get("text") or ""
             session.manager.on_partial(text, msg.get("language"))
-            await session.broadcast({"type": "partial", "text": text, "language": msg.get("language")})
+            await session.broadcast({
+                "type": "partial",
+                "text": text,
+                "language": msg.get("language"),
+            })
         elif event == "transcript.final":
             start = _as_seconds(msg.get("start_s"), session)
             end = _as_seconds(msg.get("end_s"), session, fallback_now=True)

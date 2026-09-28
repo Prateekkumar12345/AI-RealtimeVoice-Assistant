@@ -276,7 +276,6 @@ export default function App() {
                 <span style={{ color: "#6b7280", fontSize: 12, marginRight: 8 }}>
                   [{seg.start !== null && seg.start !== undefined ? fmtTime(seg.start) : index + 1}]
                 </span>
-                <b style={{ fontSize: 12, color: "#374151", marginRight: 6 }}>Speaker:</b>
                 <span>{seg.text}</span>
               </div>
             ))}

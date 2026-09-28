@@ -58,6 +58,46 @@ CAPTURE_JOIN_DIAGNOSTICS = os.getenv("CAPTURE_JOIN_DIAGNOSTICS", "true").strip()
 REQUIRE_SIGNED_IN_PROFILE = os.getenv("REQUIRE_SIGNED_IN_PROFILE", "false").strip().lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
+# Zero-intervention Google sign-in
+# ---------------------------------------------------------------------------
+# The bot signs itself in with no human step. Two mechanisms cooperate:
+#
+#   1. SESSION_VAULT_DIR -- a ~180 KB copy of the 8 Chrome files that actually
+#      hold the Google session (Local State's DPAPI key + Default/Network/Cookies
+#      + Preferences + 5 others). Chrome unlocks the cookies itself on startup,
+#      so nothing here is ever decrypted by the bot. Once the vault is filled,
+#      every later run joins with no password involved at all.
+#
+#   2. GOOGLE_EMAIL/GOOGLE_PASSWORD -- used ONLY when the vault is empty or
+#      Google has expired the session (roughly once a year; the SID cookies on
+#      a live profile run to Oct 2027). Google often refuses a scripted
+#      sign-in with a CAPTCHA, so this is a recovery path, not a daily
+#      dependency. If it is refused, the bot says so plainly instead of
+#      hanging or silently joining as an anonymous guest.
+#
+# The password is deliberately read WITHOUT .strip(): leading/trailing spaces
+# are significant characters in a password, and every other secret in this file
+# is stripped. Truncating it here would make the bot unloginable.
+GOOGLE_EMAIL = (os.getenv("GOOGLE_EMAIL") or "").strip()
+GOOGLE_PASSWORD = os.getenv("GOOGLE_PASSWORD") or ""
+# Zero-intervention is ON by default: with credentials present the bot signs
+# itself in rather than waiting for a human to admit it.
+AUTO_LOGIN = os.getenv("AUTO_LOGIN", "true").strip().lower() in ("1", "true", "yes")
+# Where the session vault lives. Empty disables the vault (password login only).
+# No implicit default: a missing/blank value must actually turn the vault off, or
+# it silently takes priority over CHROME_USER_DATA_DIR and the bot seeds itself
+# from a vault that may hold no usable account.
+SESSION_VAULT_DIR = os.getenv("SESSION_VAULT_DIR", "").strip()
+# How long to wait for each Google sign-in field before giving up.
+LOGIN_FIELD_TIMEOUT = int(os.getenv("LOGIN_FIELD_TIMEOUT", "30") or "30")
+# How long to wait for Google to land us back on a signed-in page.
+LOGIN_SETTLE_TIMEOUT = int(os.getenv("LOGIN_SETTLE_TIMEOUT", "25") or "25")
+# Overrides undetected-chromedriver's unreliable ChromeDriver version guess.
+# Leave empty to read the real version from the registry; set it only if
+# auto-detection fails (chrome://version shows the major).
+CHROME_VERSION_MAIN = (os.getenv("CHROME_VERSION_MAIN") or "").strip()
+
+# ---------------------------------------------------------------------------
 # Recording health
 # ---------------------------------------------------------------------------
 # The bot never touches anyone's physical mic — it only captures the remote

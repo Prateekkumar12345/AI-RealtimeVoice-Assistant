@@ -41,6 +41,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 import config
+from utils import chrome_login, session_vault
 from utils.audio_recorder import StreamingAudioRecorder, load_capture_script
 
 # --------------------------------------------------------------------- states
@@ -282,6 +283,29 @@ def explain_block(page_text):
     return headline, FALLBACK_BLOCK_GUIDANCE
 
 
+# The only experimental option that is a genuine Chrome option, and so the only
+# one safe to forward to chromedriver via goog:chromeOptions. Everything else we
+# set (detach, excludeSwitches, useAutomationExtension) is interpreted by
+# Selenium's own launcher and rejected by chromedriver when handed to uc.
+_CHROME_EXPERIMENTAL_OPTIONS = frozenset({"prefs"})
+
+
+def _strip_selenium_only_options(browser_options):
+    """Drop Selenium-only experimental options before handing them to uc.
+
+    An allowlist rather than a denylist: any option that is not a real Chrome
+    option is removed, so adding a new Selenium-specific option later cannot
+    silently reintroduce a "cannot parse capability" failure at launch time.
+    Anything dropped is printed, because that error is otherwise opaque.
+    """
+    experimental = getattr(browser_options, "_experimental_options", None)
+    if not experimental:
+        return
+    for key in [k for k in experimental if k not in _CHROME_EXPERIMENTAL_OPTIONS]:
+        del experimental[key]
+        print(f"Dropped the Selenium-only Chrome option {key!r} for the undetected driver")
+
+
 def configured_profile_dir():
     """Absolute path of the bot's persistent Chrome profile, if one is configured."""
     if not config.CHROME_USER_DATA_DIR or config.EPHEMERAL_PROFILE:
@@ -405,8 +429,28 @@ def close_stale_automation_chrome():
                 continue
             print(f"Closing leftover Chrome holding the bot profile {user_data_dir}")
             proc.kill()
+            # Killing the browser is not enough: leave_meeting() is what normally
+            # deletes a throwaway profile, and a hard-killed run never reaches it.
+            # Without this the temp folders pile up in %TEMP%, each carrying a
+            # full cache. The session has already been vaulted by then, so
+            # nothing of value is lost -- this only reclaims disk.
+            if TEMP_PROFILE_PREFIX in user_data_dir:
+                _remove_stale_profile_dir(user_data_dir)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+
+
+def _remove_stale_profile_dir(user_data_dir):
+    """Delete an orphaned throwaway profile directory. Best effort."""
+    if not os.path.isdir(user_data_dir):
+        return
+    try:
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+    except OSError as error:
+        print(f"Could not remove the orphaned bot profile {user_data_dir}: {error}")
+        return
+    if not os.path.isdir(user_data_dir):
+        print(f"Removed the orphaned bot profile {user_data_dir}")
 
 
 class GoogleMeetBot:
@@ -454,7 +498,23 @@ class GoogleMeetBot:
         self.last_error = None
         self._set_state(STATE_LAUNCHING)
 
-        if config.EPHEMERAL_PROFILE:
+        # Precedence: vault-backed throwaway profile, then the legacy
+        # CHROME_USER_DATA_DIR / EPHEMERAL_PROFILE pair. The vault wins whenever
+        # SESSION_VAULT_DIR is set, even when it is still empty: a fresh
+        # throwaway profile is exactly what automatic sign-in needs, because the
+        # session it earns is captured into the vault on the way out.
+        if session_vault.vault_dir():
+            self.profile_dir = tempfile.mkdtemp(prefix=TEMP_PROFILE_PREFIX)
+            self.temporary_profile = True
+            seeded = session_vault.seed(session_vault.vault_dir(), self.profile_dir)
+            if seeded:
+                print(f"Seeded a throwaway profile from the session vault ({seeded} files)")
+            else:
+                print(
+                    "The session vault is empty; the bot will sign in itself and "
+                    "populate it for next time."
+                )
+        elif config.EPHEMERAL_PROFILE:
             self.profile_dir = tempfile.mkdtemp(prefix=TEMP_PROFILE_PREFIX)
             self.temporary_profile = True
         elif config.CHROME_USER_DATA_DIR:
@@ -464,7 +524,13 @@ class GoogleMeetBot:
             self.profile_dir = None
 
         browser_options = Options()
-        browser_options.add_experimental_option("detach", True)
+        # NOTE: "detach" is deliberately NOT set here. It is a chromedriver
+        # service flag, not a Chrome option, and webdriver.Chrome is the only
+        # thing that translates it correctly. undetected_chromedriver instead
+        # forwards experimental options verbatim into goog:chromeOptions, and
+        # chromedriver then refuses to start with
+        #     "unrecognized chrome option: detach".
+        # _launch() therefore adds it per-driver, on the stock path only.
         browser_options.add_argument("--use-fake-ui-for-media-stream")
         # No echo: the bot's Chrome plays nothing to the speakers, and its microphone
         # is a silent virtual device, so the bot can never feed audio back.
@@ -498,7 +564,7 @@ class GoogleMeetBot:
 
         try:
             print("Setting up Chrome browser...")
-            self.browser = webdriver.Chrome(options=browser_options)
+            self.browser = self._launch(browser_options)
             self._register_active()
             self._install_capture_script()
             print("Chrome setup successful")
@@ -509,6 +575,91 @@ class GoogleMeetBot:
             self._fail(f"Chrome setup failed: {error}")
             self.leave_meeting()
             return False
+
+    def _launch(self, browser_options):
+        """Start Chrome, preferring undetected_chromedriver when we may need to sign in.
+
+        A plain webdriver.Chrome is enough to join a meeting with a valid
+        session, but Google's sign-in form rejects a stock Selenium-controlled
+        browser ("This browser or app may not be secure"). undetected_chromedriver
+        patches that away, so it is used whenever automatic sign-in is
+        configured -- which is also why CHROME_VERSION_MAIN matters: uc has to be
+        told which ChromeDriver build to fetch and its own detection guesses
+        wrong across Chrome auto-updates.
+
+        Falls back to the stock driver if uc is unavailable, so a missing
+        optional dependency degrades to the old behaviour instead of failing.
+        """
+        if not self._needs_undetected():
+            # webdriver.Chrome is the one path that understands the "detach"
+            # experimental option, so it is set here rather than in
+            # setup_browser() where it would leak into the uc capabilities.
+            browser_options.add_experimental_option("detach", True)
+            return webdriver.Chrome(options=browser_options)
+
+        try:
+            import undetected_chromedriver as uc
+        except ImportError:
+            print(
+                "undetected-chromedriver is not installed; falling back to the "
+                "standard driver. Automatic sign-in will likely be refused by Google."
+            )
+            browser_options.add_experimental_option("detach", True)
+            return webdriver.Chrome(options=browser_options)
+
+        try:
+            version_main = chrome_login.chrome_major_version()
+        except RuntimeError as error:
+            print(f"{error} Falling back to the standard driver.")
+            browser_options.add_experimental_option("detach", True)
+            return webdriver.Chrome(options=browser_options)
+
+        print(f"Launching undetected Chrome (Chrome {version_main})...")
+        # Selenium-only experimental options must be stripped before the options
+        # reach uc. They are consumed by Selenium's *own* driver launcher, which
+        # decides which command-line switches to emit; since uc launches Chrome
+        # itself, they are never interpreted and chromedriver rejects them as
+        # unknown Chrome options:
+        #     "unrecognized chrome option: excludeSwitches"  (likewise detach,
+        #     useAutomationExtension)
+        # Nothing is lost by dropping them: the switches they suppress
+        # (--enable-automation, --disable-extensions) are added by Selenium, not
+        # by chromedriver, so with uc they are absent anyway. The real
+        # anti-detection arguments below are ordinary Chrome flags and are
+        # untouched.
+        _strip_selenium_only_options(browser_options)
+
+        # from_options() re-wraps the same arguments and experimental options in
+        # uc's own ChromeOptions, which is what lets uc find the prefs blob and
+        # the user-data-dir before it builds capabilities. Passing the plain
+        # selenium Options straight through works for the arguments but skips
+        # that handling. Note that it shares the underlying dicts with
+        # browser_options, which is fine: this object is not reused afterwards.
+        uc_options = uc.ChromeOptions.from_options(browser_options)
+        # NB: uc's Chrome.__del__ calls quit() a second time after leave_meeting()
+        # has already quit, which fails on the dead handle (OSError: [WinError 6]).
+        # It is shadowed in leave_meeting(), *after* the real quit, not here --
+        # shadowing it now would make our own teardown a no-op.
+        return uc.Chrome(options=uc_options, version_main=version_main)
+
+    def _needs_undetected(self):
+        """True when this run may have to type the configured password in.
+
+        Checked before the browser starts, and the profile has already been
+        seeded by then, so the honest test is the profile itself rather than the
+        vault's file listing: if the seeded profile already carries an account,
+        no form is ever shown and the stock Selenium driver is fine. That skips
+        undetected-chromedriver -- which patches the binary and spawns a
+        patched-driver cache -- on every ordinary run after the first.
+        """
+        if not config.AUTO_LOGIN or not chrome_login.credentials_configured():
+            return False
+        if self.profile_dir and profile_is_signed_in(
+            self.profile_dir, config.CHROME_PROFILE_DIRECTORY
+        ):
+            return False
+        return True
+
 
     def _install_capture_script(self):
         """Inject window.__meetRec at document start so it exists in every Meet page."""
@@ -569,6 +720,13 @@ class GoogleMeetBot:
         if not self._preflight_profile():
             return False
 
+        # Zero human intervention: if the session vault had nothing usable,
+        # sign in with the configured credentials before touching the meeting
+        # URL, so the rest of the join runs with a real Google identity.
+        if self._should_sign_in():
+            if not self.sign_in_to_google():
+                return False
+
         for attempt in range(1, config.JOIN_ATTEMPTS + 1):
             self._block_text = ""
             if attempt > 1:
@@ -584,6 +742,16 @@ class GoogleMeetBot:
                     continue
                 return self._fail(self._blocked_message(text))
             if page == PAGE_ACCOUNT_CHOOSER:
+                # Google bounced us to a sign-in page. If automatic sign-in is
+                # configured, try it once; the profile is then genuinely signed
+                # in, so reload the meeting and continue the normal join. If it
+                # is not configured, this is the original terminal failure.
+                if self._should_sign_in():
+                    if not self.sign_in_to_google():
+                        return False
+                    if attempt < config.JOIN_ATTEMPTS:
+                        continue
+                    return self._fail(self.last_error or "Google sign-in did not produce a session.")
                 return self._fail(self._account_chooser_message(text))
             if page == PAGE_IN_MEETING:
                 # Rejoined straight into the call (Meet restored the session).
@@ -634,6 +802,88 @@ class GoogleMeetBot:
         self._set_state(STATE_IN_MEETING, "Meeting joined successfully")
         return True
 
+    # --------------------------------------------------------------- sign-in
+    def _should_sign_in(self):
+        """True when this run is allowed to type the configured password in.
+
+        Gated on AUTO_LOGIN, both credentials being present, and the profile not
+        already carrying an account. The last condition is what makes the vault
+        worthwhile: once it is populated the password is never used again.
+        """
+        if not config.AUTO_LOGIN:
+            return False
+        if not chrome_login.credentials_configured():
+            return False
+        if self.page_account:
+            return False
+        return True
+
+    def sign_in_to_google(self):
+        """Sign the bot's Chrome in, then persist the session into the vault.
+
+        Returns True only when the profile is genuinely signed in afterwards --
+        Chrome accepting the form is not enough, because Google can hand back a
+        challenge that looks like a success page. The check is the same
+        account_info read used everywhere else, so there is one definition of
+        "signed in" in this codebase.
+        """
+        if not self._browser_alive():
+            return self._fail("Chrome is not available; cannot sign in to Google.")
+
+        self._set_state(STATE_LOADING, "Signing in to Google")
+        try:
+            chrome_login.sign_in(self.browser, browser_alive=self._browser_alive)
+        except chrome_login.LoginChallenge as challenge:
+            return self._fail(self._sign_in_failure_message(str(challenge)))
+        except (NoSuchWindowException, WebDriverException) as error:
+            return self._fail(f"Chrome closed or errored during the Google sign-in: {error}")
+        except Exception as error:
+            return self._fail(f"Google sign-in failed unexpectedly: {error}")
+
+        # Do not trust the page: confirm the profile now carries an account.
+        if not profile_is_signed_in(self.profile_dir, config.CHROME_PROFILE_DIRECTORY):
+            return self._fail(
+                "Google accepted the sign-in form but the browser profile still has no "
+                "Google account attached. The sign-in did not take effect."
+            )
+        self.page_account = profile_google_account(
+            self.profile_dir, config.CHROME_PROFILE_DIRECTORY
+        )
+        print(f"Signed in to Google as {self.page_account}")
+
+        # Capture it now so later runs need no password at all. This is the step
+        # that makes automatic sign-in a once-a-year cost rather than a per-run one.
+        self._save_session_vault()
+        return True
+
+    def _save_session_vault(self):
+        vault_path = session_vault.vault_dir()
+        if not vault_path or not self.profile_dir or not self.page_account:
+            return
+        try:
+            saved = session_vault.save(self.profile_dir, vault_path)
+        except Exception as error:
+            print(f"Could not save the session to the vault: {error}")
+            return
+        if saved:
+            status = session_vault.status(vault_path)
+            expiry = status.get("earliest_auth_expiry") or "unknown"
+            print(
+                f"Session saved to the vault ({status.get('cookie_count', 0)} cookies, "
+                f"good until {expiry}). Later runs will not need the password."
+            )
+
+    def _sign_in_failure_message(self, detail):
+        """A refusal from Google, in the operator's terms rather than a stack trace."""
+        shot = self.capture_diagnostics("sign_in_failed")
+        message = (
+            "Automatic Google sign-in was refused, so the bot cannot join this meeting "
+            f"as a signed-in account.\n  {detail}"
+        )
+        if shot:
+            message += f"\n  Screenshot: {shot}"
+        return message
+
     def _preflight_profile(self):
         """Warn (or refuse) when the bot is anonymous and the meeting likely needs an identity."""
         if not self.profile_dir:
@@ -645,6 +895,12 @@ class GoogleMeetBot:
         if profile_is_signed_in(self.profile_dir, config.CHROME_PROFILE_DIRECTORY):
             self.page_account = profile_google_account(self.profile_dir, config.CHROME_PROFILE_DIRECTORY)
             print(f"Bot Chrome profile is signed into Google as {self.page_account}")
+            return True
+        if self._should_sign_in():
+            print(
+                "No Google session in this profile yet; the bot will sign in itself "
+                "with the configured credentials."
+            )
             return True
         if config.REQUIRE_SIGNED_IN_PROFILE:
             return self._fail(
@@ -813,6 +1069,16 @@ class GoogleMeetBot:
                 "sees it as an unidentified guest."
             )
         if self.temporary_profile:
+            if session_vault.is_populated():
+                return (
+                    "The bot runs a throwaway Chrome profile seeded from its session "
+                    "vault, so the account it presents is whatever the vault holds."
+                )
+            if self._should_sign_in():
+                return (
+                    "The bot runs a throwaway Chrome profile and signs in with the "
+                    "credentials in .env, so Meet sees it as that Google account."
+                )
             return (
                 "The bot runs a throwaway Chrome profile with no Google account, so Meet sees it "
                 "as an unidentified guest."
@@ -1167,7 +1433,6 @@ class GoogleMeetBot:
             return
         self._cleanup_done = True
         print("Leaving meeting...")
-
         try:
             if self.browser and self._browser_alive():
                 self.find_and_click_leave_button()
@@ -1180,9 +1445,22 @@ class GoogleMeetBot:
                     print("Browser closed")
                 except Exception as error:
                     print(f"Browser quit reported (already closed?): {error}")
+                # undetected-chromedriver's __del__ calls quit() again on a dead
+                # handle. Neutralise it only now that the real quit has happened.
+                try:
+                    self.browser.quit = lambda: None
+                except (AttributeError, TypeError):
+                    pass
                 self.browser = None
             self.meeting_is_active = False
             self._unregister_active()
+
+            # Persist the Google session the browser just held, so the next run
+            # can reuse it and never touch the password again. This MUST happen
+            # before the throwaway profile is deleted below, and after quit() so
+            # Chrome has flushed its cookies to disk.
+            if self.temporary_profile and self.page_account:
+                self._save_session_vault()
 
             # Persistent profiles contain the bot's Google login and must survive.
             if self.temporary_profile and self.profile_dir and os.path.isdir(self.profile_dir):

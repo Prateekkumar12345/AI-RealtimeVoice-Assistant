@@ -2,6 +2,10 @@ fastapi
 uvicorn[standard]
 websockets
 selenium
+# Google refuses a stock Selenium-controlled sign-in form ("This browser or app
+# may not be secure"), so meet_bot.py uses this whenever it may need to type a
+# password. Skipped only when the session vault is already populated.
+undetected-chromedriver
 psutil
 python-dotenv
 httpx
