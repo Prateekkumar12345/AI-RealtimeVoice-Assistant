@@ -112,9 +112,15 @@ def test_field_extractor():
     seen = []
 
     old_debounce = config.LLM_DEBOUNCE_SECONDS
+    old_provider = config.LLM_PROVIDER
     old_key = config.LLM_API_KEY
+    old_sarvam_key = config.SARVAM_API_KEY
     config.LLM_DEBOUNCE_SECONDS = 0.15
-    config.LLM_API_KEY = ""  # force regex fallback offline
+    # Force regex fallback offline: with LLM_PROVIDER=sarvam the extractor falls
+    # back to SARVAM_API_KEY, so blanking only LLM_API_KEY would make a live call.
+    config.LLM_PROVIDER = "openai"
+    config.LLM_API_KEY = ""
+    config.SARVAM_API_KEY = ""
 
     def on_fields(fields):
         seen.extend(fields)
@@ -132,7 +138,9 @@ def test_field_extractor():
     finally:
         extractor.stop()
         config.LLM_DEBOUNCE_SECONDS = old_debounce
+        config.LLM_PROVIDER = old_provider
         config.LLM_API_KEY = old_key
+        config.SARVAM_API_KEY = old_sarvam_key
 
 
 # ------------------------------------------------------------- 4. SessionStore

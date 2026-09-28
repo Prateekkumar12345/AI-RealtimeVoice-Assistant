@@ -13,11 +13,14 @@ the *unconsumed tail* of the transcript:
     (1.5s of quiet)
     LLM  ->  [{"field":"name","value":"Prateek Kumar"}]
 
-Provider: any OpenAI-compatible /chat/completions endpoint. When no LLM_API_KEY
-is configured, a built-in regex extractor is used so the flow still works offline.
+Provider: by default Sarvam's Chat Completion API (`sarvam-105b` at
+api.sarvam.ai/v1), authenticated with the same SARVAM_API_KEY used for
+streaming STT. Set LLM_PROVIDER=openai to target any OpenAI-compatible
+/chat/completions endpoint with LLM_BASE_URL/LLM_API_KEY instead. When no key at
+all is configured, a built-in regex extractor (name, age, weight, email, phone)
+is used so the flow still works offline.
 """
 import json
-import os
 import re
 import threading
 import time
@@ -105,16 +108,36 @@ class FieldExtractor:
 
     # ------------------------------------------------------------- extractors
     def extract(self, text):
-        if config.LLM_API_KEY:
+        if self._llm_available():
             return self._llm_extract(text) or self._regex_extract(text)
         return self._regex_extract(text)
+
+    def _llm_available(self):
+        if config.LLM_PROVIDER == "sarvam":
+            # Sarvam's chat API authenticates with the same subscription key
+            # used for streaming STT, so one key powers the whole pipeline.
+            return bool(config.SARVAM_API_KEY or config.LLM_API_KEY)
+        return bool(config.LLM_API_KEY)
 
     def _llm_extract(self, text):
         import httpx
 
+        api_key = config.LLM_API_KEY or config.SARVAM_API_KEY
+        is_sarvam = "sarvam.ai" in config.LLM_BASE_URL or config.LLM_PROVIDER == "sarvam"
+        headers = {"Content-Type": "application/json"}
+        if is_sarvam:
+            # Sarvam's documented auth header; it also accepts Bearer, but
+            # api-subscription-key works for every Sarvam API.
+            headers["api-subscription-key"] = api_key
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+
         user_prompt = (
             f"Extract fields from this meeting transcript.\n\n"
             f"Schema: {config.LLM_FIELD_SCHEMA}\n\n"
+            "Return ONLY a JSON array of the fields you found, e.g. "
+            '[{"field": "name", "value": "Asha Rao", "confidence": 0.95}]. '
+            "Omit any field the speaker did not state.\n\n"
             f"Transcript:\n{text[:12000]}"
         )
         payload = {
@@ -125,10 +148,14 @@ class FieldExtractor:
                 {"role": "user", "content": user_prompt},
             ],
         }
+        # Sarvam thinks by default; the thinking tokens count against
+        # max_tokens and can leave the JSON array empty on short replies.
+        if config.LLM_DISABLE_THINKING and is_sarvam:
+            payload["reasoning_effort"] = None
         with httpx.Client(timeout=config.LLM_TIMEOUT) as client:
             response = client.post(
                 f"{config.LLM_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
+                headers=headers,
                 json=payload,
             )
             response.raise_for_status()
@@ -167,6 +194,34 @@ class FieldExtractor:
     def _regex_extract(text):
         """Offline fallback so the demo works without an LLM key."""
         fields = []
+
+        name = re.search(
+            r"\b(?:my name is|i am called|this is|myself)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})",
+            text,
+        )
+        if name:
+            fields.append({"field": "name", "value": name.group(1).strip(), "confidence": 0.7, "source": "regex"})
+
+        age = re.search(
+            r"\b(?:i am|i'm|my age is|age is|aged)\s+(\d{1,3})\s*(?:years old|yrs old|years|yrs)?\b",
+            text,
+            re.IGNORECASE,
+        )
+        if age:
+            value = int(age.group(1))
+            if 1 <= value <= 120:
+                fields.append({"field": "age", "value": f"{value} years", "confidence": 0.7, "source": "regex"})
+
+        weight = re.search(
+            r"\b(?:i weigh|my weight is|weight is)\s+(\d{2,3}(?:\.\d)?)\s*(?:kg|kgs|kilos|kilograms)?\b",
+            text,
+            re.IGNORECASE,
+        )
+        if weight:
+            value = float(weight.group(1))
+            if 1 <= value <= 500:
+                fields.append({"field": "weight", "value": f"{value:g} kg", "confidence": 0.7, "source": "regex"})
+
         email = re.search(r"[\w.+-]+@[\w-]+\.[A-Za-z]{2,}", text)
         if email:
             fields.append({"field": "email", "value": email.group(0), "confidence": 0.8, "source": "regex"})

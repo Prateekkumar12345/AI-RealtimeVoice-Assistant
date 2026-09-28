@@ -69,6 +69,18 @@ class SessionState:
         self.conn_started_at = time.time()
         self.last_speech_start = None
         self.audio_duration_s = None
+        # No-audio detection: the bot only records remote WebRTC audio tracks
+        # from other participants, so if everyone stays muted there is genuinely
+        # nothing to capture. We can't unmute anyone, but we can flag it fast
+        # instead of failing silently. See _handle_capture_monitor().
+        self.last_audio_seen_at = None
+        self.audio_warned = False
+        # True while a bot's browser teardown (leave_meeting -> browser.quit())
+        # is still running in a background thread. A new session must not be
+        # allowed to start until this finishes, or its own Chrome-process
+        # cleanup can kill the still-quitting bot's chromedriver out from
+        # under it ("no such window: target window already closed").
+        self.cleanup_pending = False
 
     async def broadcast(self, message):
         for ws in list(self.subscribers):
@@ -105,6 +117,10 @@ def document(session, include_partial=True):
         "fields": session.fields_list,
         "wav_file": session.wav_file,
         "audio_duration_s": session.audio_duration_s,
+        # Which step of the join the bot is on (launching -> loading -> prejoin ->
+        # joining -> waiting_for_admission -> in_meeting -> recording), so a stuck
+        # join can be told apart from a Meet refusal.
+        "bot_state": session.bot.state if session.bot else None,
     }
     return doc
 
@@ -130,6 +146,17 @@ class JoinRequest(BaseModel):
 
 
 # ------------------------------------------------------------------ REST
+def _llm_provider_configured():
+    """True when any LLM extraction path can authenticate.
+
+    The Sarvam provider reuses the STT subscription key, so the UI must not
+    claim 'regex-fallback' just because LLM_API_KEY itself is empty.
+    """
+    if config.LLM_PROVIDER == "sarvam":
+        return bool(config.SARVAM_API_KEY or config.LLM_API_KEY)
+    return bool(config.LLM_API_KEY)
+
+
 @app.get("/api/config")
 def get_config():
     return {
@@ -139,7 +166,9 @@ def get_config():
         "mode": config.SARVAM_STREAMING_MODE,
         "language_code": config.SARVAM_LANGUAGE_CODE,
         "llm_enabled": config.LLM_EXTRACTION_ENABLED,
-        "llm_provider_configured": bool(config.LLM_API_KEY),
+        "llm_provider": config.LLM_PROVIDER,
+        "llm_model": config.LLM_MODEL,
+        "llm_provider_configured": _llm_provider_configured(),
         "mongo_configured": bool(config.MONGO_URI),
     }
 
@@ -151,7 +180,7 @@ def start_session(payload: JoinRequest):
 
     with _active_lock:
         for session in _sessions.values():
-            if session.status in ("joining", "recording", "stopping"):
+            if session.status in ("joining", "recording", "stopping") or session.cleanup_pending:
                 raise HTTPException(400, "A session is already in progress")
         sid = datetime.now().strftime("%Y%m%d_%H%M%S")
         session = SessionState(sid, payload.meeting_url)
@@ -203,12 +232,12 @@ def _join_worker(session):
     bot = GoogleMeetBot()
     session.bot = bot
     try:
-        if not bot.join_meeting(session.meeting_url):
+        if not bot.join_meeting(session.meeting_url, session_id=session.session_id):
             session.status = "failed"
             session.error = bot.last_error or "Failed to join meeting"
             _persist(session)
             _broadcast(session, {"type": "status", "status": "failed", "error": session.error})
-            _safe_leave(bot)
+            _safe_leave(session, bot)
             return
 
         started = bot.start_recording(session.session_id)
@@ -217,7 +246,7 @@ def _join_worker(session):
             session.error = bot.last_error or "Failed to start recording"
             _persist(session)
             _broadcast(session, {"type": "status", "status": "failed", "error": session.error})
-            _safe_leave(bot)
+            _safe_leave(session, bot)
             return
 
         session.status = "recording"
@@ -228,17 +257,27 @@ def _join_worker(session):
         session.error = str(error)
         _persist(session)
         _broadcast(session, {"type": "status", "status": "failed", "error": session.error})
-        _safe_leave(bot)
+        _safe_leave(session, bot)
 
 
-def _safe_leave(bot):
+def _safe_leave(session, bot):
     """Always tear the browser + chromedriver down, even on a failed join.
     Leaving this unclosed is what causes later sessions to time out talking
-    to chromedriver (orphaned Chrome/chromedriver processes pile up)."""
+    to chromedriver (orphaned Chrome/chromedriver processes pile up).
+
+    cleanup_pending stays True for the whole teardown so a new session
+    can't start (and run close_stale_automation_chrome()) while this bot's
+    browser.quit() is still in flight -- that race is what produces
+    'no such window: target window already closed' from a second bot's
+    startup killing this one's chromedriver mid-shutdown.
+    """
+    session.cleanup_pending = True
     try:
         bot.leave_meeting()
     except Exception as error:
         print(f"Cleanup after failed join did not fully succeed: {error}")
+    finally:
+        session.cleanup_pending = False
 
 
 def _stop_worker(session):
@@ -256,7 +295,7 @@ def _stop_worker(session):
         # Without this, the bot's Chrome window (and its chromedriver process)
         # is left running forever after every single session, success or not.
         if session.bot:
-            _safe_leave(session.bot)
+            _safe_leave(session, session.bot)
     _persist(session)
     _broadcast(session, {"type": "done", "session": document(session, include_partial=False)})
 
@@ -345,6 +384,41 @@ async def _handle_sarvam_message(session, msg):
     return False
 
 
+async def _handle_capture_monitor(session, status):
+    """Watch the page-side capture stats (tracksSeen/peak) and tell the UI
+    when no participant audio has been seen for a while, instead of quietly
+    writing a silent WAV. This can only detect the problem — the bot has no
+    way to unmute another participant's microphone for them."""
+    tracks_seen = status.get("tracksSeen") or 0
+    peak = status.get("peak") or 0
+    now = time.time()
+
+    heard_audio = tracks_seen > 0 or peak > 0.005
+    if heard_audio:
+        session.last_audio_seen_at = now
+        if session.audio_warned:
+            session.audio_warned = False
+            await session.broadcast({
+                "type": "audio_warning",
+                "active": False,
+            })
+        return
+
+    since = now - (session.last_audio_seen_at or session.conn_started_at)
+    if since >= config.NO_AUDIO_WARNING_SECONDS and not session.audio_warned:
+        session.audio_warned = True
+        await session.broadcast({
+            "type": "audio_warning",
+            "active": True,
+            "message": (
+                "No audio detected from the meeting yet. The bot only records "
+                "other participants' microphones (it can't unmute them for "
+                "you) — ask everyone in the call to check their mic is on."
+            ),
+            "seconds": round(since),
+        })
+
+
 def _as_seconds(value, session, fallback_now=False):
     if value in (None, ""):
         if fallback_now and session.last_speech_start:
@@ -418,13 +492,15 @@ async def ws_audio(ws: WebSocket):
                 elif event == "ping":
                     pass
                 elif event == "monitor":
+                    status = msg.get("status") or {}
                     await session.broadcast({
                         "type": "debug",
                         "stt": session.sarvam_state,
                         "sarvam_error": session.sarvam_error,
-                        "capture": msg.get("status") or {},
-                        "wav_bytes": (msg.get("status") or {}).get("wav_bytes"),
+                        "capture": status,
+                        "wav_bytes": status.get("wav_bytes"),
                     })
+                    await _handle_capture_monitor(session, status)
 
         async def ping_loop():
             # Sarvam closes the socket with code 1008 if nothing is sent for a

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import FieldsForm from "./components/FieldsForm.jsx";
 
 const statusColors = {
   idle: "#6b7280",
@@ -30,6 +31,7 @@ export default function App() {
   const [wsState, setWsState] = useState("closed");
   const [sessions, setSessions] = useState([]);
   const [debug, setDebug] = useState(null);
+  const [audioWarning, setAudioWarning] = useState(null);
   const [reconnecting, setReconnecting] = useState(false);
   const wsRef = useRef(null);
   const transcriptEndRef = useRef(null);
@@ -126,6 +128,9 @@ export default function App() {
           applySnapshot(msg.session);
           setPartial("");
           break;
+        case "audio_warning":
+          setAudioWarning(msg.active ? msg.message : null);
+          break;
         case "debug":
           // Only shown for a few seconds after each update so the header stays calm.
           debugAtRef.current = Date.now();
@@ -158,6 +163,7 @@ export default function App() {
       setSegments([]);
       setPartial("");
       setFields([]);
+      setAudioWarning(null);
       connect(data.session_id);
     } catch (e) {
       setError(`Could not reach the server: ${e}`);
@@ -240,6 +246,12 @@ export default function App() {
             </div>
           )}
 
+          {live && audioWarning && (
+            <div style={{ background: "#fff7ed", border: "1px solid #fdba74", color: "#9a3412", padding: "10px 14px", borderRadius: 8, marginBottom: 12, fontSize: 13 }}>
+              ⚠️ {audioWarning}
+            </div>
+          )}
+
           {debug && debug.capture && (
             <div style={{ background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 8, padding: "8px 12px", marginBottom: 12, fontSize: 12, color: "#0369a1", fontFamily: "monospace" }}>
               <b>debug</b> · stt {debug.stt || "?"} {debug.sarvam_error ? `· err: ${debug.sarvam_error}` : ""} ·{" "}
@@ -273,7 +285,9 @@ export default function App() {
         </section>
 
         <aside style={{ flex: 1, minWidth: 260 }}>
-          <h3 style={{ marginTop: 0 }}>Extracted fields</h3>
+          <FieldsForm fields={fields} live={live} />
+
+          <h3 style={{ marginTop: 24 }}>Extracted fields</h3>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {fields.length === 0 && <div style={{ color: "#9ca3af", fontSize: 14 }}>Form values appear here…</div>}
             {fields.map((f, index) => (
