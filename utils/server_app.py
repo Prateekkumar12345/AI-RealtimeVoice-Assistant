@@ -43,6 +43,10 @@ app.add_middleware(
 
 STORE = SessionStore()
 
+# Any timestamp above this is wall-clock seconds, not a duration. A meeting
+# running for a month is 2.6M seconds, so a value past 1e9 cannot be an offset.
+EPOCH_LIKE_SECONDS = 1_000_000_000
+
 # Registrar of active sessions, keyed by session_id.
 _active_lock = threading.Lock()
 _sessions = {}  # sid -> SessionState
@@ -57,7 +61,9 @@ class SessionState:
         self.ended_at = None
         self.status = "joining"  # joining | recording | stopping | done | failed
         self.error = None
-        self.manager = TranscriptManager(sid, self.started_at)
+        self.manager = TranscriptManager(
+            sid, self.started_at, speaker_attribution=config.SPEAKER_ATTRIBUTION
+        )
         self.extractor = None
         self.bot = None
         self.wav_file = None
@@ -76,6 +82,9 @@ class SessionState:
         # instead of failing silently. See _handle_capture_monitor().
         self.last_audio_seen_at = None
         self.audio_warned = False
+        # Speaker attribution: {speaker_count, speakers:[...]}. Updated as the
+        # browser reports voice activity, and included in document().
+        self.speakers_seen = {"speaker_count": 0, "speakers": []}
         # True while a bot's browser teardown (leave_meeting -> browser.quit())
         # is still running in a background thread. A new session must not be
         # allowed to start until this finishes, or its own Chrome-process
@@ -115,6 +124,10 @@ def document(session, include_partial=True):
         "partial": snap["partial"] if include_partial else "",
         "language": snap["language"],
         "segments": snap["segments"],
+        # How many distinct people have spoken, and who they were mapped to.
+        "speaker_count": snap.get("speaker_count", 0),
+        "speakers": snap.get("speakers", []),
+        "current_speaker": snap.get("speaker"),
         "fields": session.fields_list,
         "wav_file": session.wav_file,
         "audio_duration_s": session.audio_duration_s,
@@ -171,6 +184,7 @@ def get_config():
         "llm_model": config.LLM_MODEL,
         "llm_provider_configured": _llm_provider_configured(),
         "mongo_configured": bool(config.MONGO_URI),
+        "speaker_attribution": config.SPEAKER_ATTRIBUTION,
         # Never includes the password: only whether one is set, plus what the
         # session vault currently holds (email, cookie count, expiry).
         "auto_login": config.AUTO_LOGIN,
@@ -327,6 +341,7 @@ async def _handle_sarvam_message(session, msg):
                 "type": "partial",
                 "text": text,
                 "language": msg.get("language"),
+                "speaker": session.manager.current_speaker(),
             })
         elif event == "transcript.final":
             start = _as_seconds(msg.get("start_s"), session)
@@ -334,6 +349,7 @@ async def _handle_sarvam_message(session, msg):
             language = msg.get("language")
             segment = session.manager.on_final(msg.get("text"), start, end, language)
             if segment:
+                segment["speaker_count"] = session.manager.speakers.count
                 _persist(session)
                 await session.broadcast({"type": "final", **segment})
                 session.extractor.schedule()
@@ -372,6 +388,7 @@ async def _handle_sarvam_message(session, msg):
             end = time.time() - session.conn_started_at
             segment = session.manager.on_final(text, None, round(end, 2), None)
             if segment:
+                segment["speaker_count"] = session.manager.speakers.count
                 _persist(session)
                 await session.broadcast({"type": "final", **segment})
                 session.extractor.schedule()
@@ -428,15 +445,36 @@ async def _handle_capture_monitor(session, status):
         })
 
 
+async def _apply_speaker_activity(session, windows):
+    """Feed per-speaker voice activity to the transcript, then re-broadcast any
+    segment that was waiting on it."""
+    if not windows:
+        return
+    session.manager.feed_activity(windows)
+    for segment in session.manager.drain_speaker_updates():
+        await session.broadcast({"type": "speaker", **segment})
+    snapshot = session.manager.speakers.snapshot()
+    session.speakers_seen = snapshot
+    await session.broadcast({"type": "speakers", **snapshot})
+
+
 def _as_seconds(value, session, fallback_now=False):
     if value in (None, ""):
         if fallback_now and session.last_speech_start:
             return round(time.time() - session.last_speech_start, 2)
         return None
     try:
-        return float(value)
+        seconds = float(value)
     except (TypeError, ValueError):
         return None
+    # Speaker attribution matches these timestamps against the browser's audio
+    # clock, which counts seconds of audio sent since the stream opened. If
+    # Sarvam ever reports absolute wall-clock instead, rebase it onto that
+    # origin so the two stay comparable.
+    if seconds > EPOCH_LIKE_SECONDS:
+        origin = session.conn_started_at or session.started_at
+        seconds = seconds - origin
+    return seconds
 
 
 @app.websocket("/ws/audio")
@@ -510,6 +548,10 @@ async def ws_audio(ws: WebSocket):
                         "wav_bytes": status.get("wav_bytes"),
                     })
                     await _handle_capture_monitor(session, status)
+                elif event == "speakers":
+                    await _apply_speaker_activity(
+                        session, msg.get("windows") or []
+                    )
 
         async def ping_loop():
             # Sarvam closes the socket with code 1008 if nothing is sent for a

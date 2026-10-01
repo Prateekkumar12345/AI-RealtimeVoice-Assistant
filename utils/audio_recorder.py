@@ -26,16 +26,32 @@ if (!window.__meetRec) { done({ok: false, error: 'capture script is not installe
 window.__meetRec.start().then(done, (error) => done({ok: false, error: String(error)}));
 """
 
+# Audio and the speaker-activity windows that describe it are pulled in a single
+# round-trip. Two separate execute_script() calls would let a poll interval fall
+# between them, which would misalign every window from the audio it belongs to.
+DRAIN_SCRIPT = """
+return {
+  chunks: window.__meetRec.drain(),
+  activity: window.__meetRec.drainActivity ? window.__meetRec.drainActivity() : [],
+};
+"""
+
 # Messages the recorder exchanges with the server's /ws/audio endpoint:
-#   bind  -> {"event": "bind",  "session_id": "..."}   (first message)
-#   audio -> {"event": "audio", "audio": "<base64>"}   (one ~1s PCM chunk)
-#   end   -> {"event": "end"}                          (graceful stop)
+#   bind     -> {"event": "bind",     "session_id": "..."}   (first message)
+#   audio    -> {"event": "audio",    "audio": "<base64>"}   (one ~1s PCM chunk)
+#   speakers -> {"event": "speakers", "windows": [...]}      (voice-activity windows)
+#   monitor  -> {"event": "monitor",  "status": {...}}       (capture status)
+#   end      -> {"event": "end"}                             (graceful stop)
 def _bind_message(session_id):
     return json.dumps({"event": "bind", "session_id": session_id})
 
 
 def _audio_message(b64_pcm):
     return json.dumps({"event": "audio", "audio": b64_pcm})
+
+
+def _speakers_message(windows):
+    return json.dumps({"event": "speakers", "windows": windows})
 
 
 AUDIO_WS_END = json.dumps({"event": "end"})
@@ -197,9 +213,15 @@ class StreamingAudioRecorder:
             if self._file is None:
                 return False
             try:
-                chunks = self.browser.execute_script("return window.__meetRec.drain();") or []
+                payload = self.browser.execute_script(DRAIN_SCRIPT) or {}
             except WebDriverException:
                 return False
+
+            chunks = payload.get("chunks") or []
+            # Activity goes first so the server already knows who is talking by
+            # the time the transcript for that same second comes back from
+            # Sarvam. Reversed, every segment would be attributed a second late.
+            self._forward_activity(payload.get("activity") or [])
 
             for chunk in chunks:
                 data = base64.b64decode(chunk)
@@ -215,6 +237,18 @@ class StreamingAudioRecorder:
                 self._poll_capture_status()
             self.drain_count += 1
             return True
+
+    def _forward_activity(self, windows):
+        """Hand per-speaker voice-activity windows to the server for attribution."""
+        if not windows or self._ws is None:
+            return
+        try:
+            with self._ws_lock:
+                self._ws.send(_speakers_message(windows))
+        except Exception:
+            # Losing activity only costs speaker labels; the WAV and the
+            # transcript are unaffected, so never fail recording over it.
+            pass
 
     def _poll_capture_status(self):
         """Read window.__meetRec.status() and report it through the relay so the

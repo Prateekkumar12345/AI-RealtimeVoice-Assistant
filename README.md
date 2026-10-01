@@ -86,6 +86,29 @@ interactive fallback by design.
 - If `SARVAM_API_KEY` is missing, the live leg reports the error but the **WAV
   recording still happens**, and `GET /api/sessions/<id>` still serves the session.
 
+## Identifying who is speaking
+
+Meet mixes every participant into a single audio stream, so the bot cannot just
+read the speaker out of the transcript. Instead the page taps each remote
+track's audio *before* the mix, measures voice activity per person, and numbers
+participants in the order they are first heard. Each committed transcript is then
+matched to whichever activity window overlaps it most, and labelled
+`Speaker 1`, `Speaker 2`, and so on. The UI shows a live speaker count and each
+line carries its own colour.
+
+This keeps **one** speech-to-text stream for the whole call. The alternative —
+one stream per person — would multiply latency and cost, and would still merge
+anyone talking at the same time. The trade-off is honest: if two people talk over
+each other for a whole sentence, that sentence goes to whoever held the floor
+longest.
+
+A transcript can arrive from Sarvam *before* the browser reports the activity for
+that moment, so unattributed lines are held and re-labelled as soon as the
+matching activity turns up. Nothing is dropped and no line is ever guessed.
+
+Numbers follow first **voice**, not join order, so a host who stays muted for the
+first five minutes is not permanently "Speaker 1".
+
 ## Key entry points
 
 | What | Where |
@@ -93,6 +116,8 @@ interactive fallback by design.
 | FastAPI app + all endpoints | `utils/server_app.py` |
 | Sarvam streaming client | `utils/sarvam_streaming.py` |
 | Debounced LLM extractor | `utils/llm_extractor.py` |
+| Speaker attribution from voice activity | `utils/speaker_registry.py` |
+| Browser audio capture + speaker taps | `utils/meet_audio_capture.js` |
 | Live transcript state | `utils/transcript_manager.py` |
 | Browser audio capture | `utils/meet_audio_capture.js` |
 | Dual-path recorder (WAV + WS) | `utils/audio_recorder.py` |

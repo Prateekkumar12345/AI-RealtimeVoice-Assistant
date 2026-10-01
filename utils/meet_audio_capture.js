@@ -16,14 +16,40 @@
 //   start()  -> Promise<{ok, error?}>   build the audio graph + start recording
 //   drain()  -> string[]                base64 PCM chunks recorded since last call
 //   stop()   -> bool                    ask the recorder to finish
-//   status() -> {started, finished, error, peak, seconds, sources, tracksSeen}
+//   status() -> {started, finished, error, peak, seconds, sources, tracksSeen,
+//                speakers, speakerCount, audioSeconds}
+//   drainActivity() -> Activity[]       voice-activity windows per speaker, since
+//                                       the last call. Each is
+//                                       {speaker, startSec, endSec} in *mixed
+//                                       audio seconds* -- the same clock Sarvam
+//                                       timestamps its transcripts in, so the
+//                                       server can attribute a transcript to a
+//                                       speaker with no wall-clock sync at all.
+//   speakers() -> Speaker[]            {speaker, speakingMs, active, firstSeenSec}
 (() => {
   if (window.self !== window.top || window.__meetRec) return;
 
   const TARGET_RATE = 16000;  // sample rate of the WAV we hand to Sarvam
   const CHUNK_BYTES = 32000;  // one second of 16 kHz mono 16-bit PCM
 
+  // Voice-activity thresholds, as RMS of the track's live audio. The two
+  // thresholds differ (hysteresis) so a speaker breathing or pausing between
+  // words does not chop one utterance into three separate "speakers talking".
+  const SPEECH_ON_RMS = 0.020;
+  const SPEECH_OFF_RMS = 0.008;
+  const ACTIVITY_POLL_MS = 200;
+  const MIN_WINDOW_SEC = 0.25;  // ignore blips shorter than this
+
   const remoteTracks = new Map(); // track.id -> live remote audio MediaStreamTrack
+
+  // Speaker identity. One Meet remote audio track ~= one participant, so the
+  // track is the speaker key. Numbers are handed out in order of first voice,
+  // which is what makes "Speaker 1" the first person actually heard rather than
+  // whoever happened to join the call first.
+  const speakersByTrack = new Map(); // track.id -> {speaker, ...}
+  let nextSpeaker = 1;
+  let outSamples = 0;   // 16 kHz mono samples pushed to Sarvam == the audio clock
+  let activity = [];    // pending {speaker, startSec, endSec}
 
   const rec = {
     started: false,
@@ -40,7 +66,12 @@
 
   let byteBuf = [];
 
+  function audioNow() {
+    return outSamples / TARGET_RATE;  // seconds of mixed audio sent so far
+  }
+
   function pushPcmSample(sample) {
+    outSamples += 1;
     byteBuf.push(sample & 0xff, (sample >> 8) & 0xff);
     if (byteBuf.length >= CHUNK_BYTES) flushBytes();
   }
@@ -67,14 +98,91 @@
       const source = graph.ctx.createMediaStreamSource(new MediaStream([track]));
       source.connect(graph.mix);
       graph.sources.set(track.id, source);
+
+      // Per-track level tap. This is connected from the *source*, not from the
+      // mix, so each speaker's level is measured in isolation. Tapping the mixed
+      // bus instead would make two people talking look like one loud person.
+      let entry = speakersByTrack.get(track.id);
+      if (!entry) {
+        entry = {
+          // Left null until this person actually talks, so numbering follows the
+          // order they are heard in rather than the order they happened to join
+          // (a muted host would otherwise always be "Speaker 1").
+          speaker: null,
+          speakingMs: 0,
+          active: false,
+          firstSeenSec: audioNow(),
+          _openAt: null,
+        };
+        speakersByTrack.set(track.id, entry);
+      }
+      const analyser = graph.ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      // An analyser with no onward connection is not pulled, so it is anchored
+      // to a zero gain. It is deliberately NOT connected to the destination.
+      const anchor = graph.ctx.createGain();
+      anchor.gain.value = 0;
+      analyser.connect(anchor);
+      anchor.connect(graph.sink);
+      entry.analyser = analyser;
+      entry.samples = new Float32Array(analyser.fftSize);
+
       track.addEventListener('ended', () => {
+        closeSpeechWindow(entry, true);
         try { source.disconnect(); } catch (e) { /* already gone */ }
+        try { analyser.disconnect(); anchor.disconnect(); } catch (e) { /* ignored */ }
         graph.sources.delete(track.id);
         remoteTracks.delete(track.id);
       });
     } catch (error) {
       rec.error = 'connect track failed: ' + error;
     }
+  }
+
+  // Turn a measured level into open/closed voice-activity windows. Windows are
+  // only emitted once they are >= MIN_WINDOW_SEC long, so a single cough never
+  // becomes its own speaker turn.
+  function pollVoiceActivity() {
+    if (!rec.graph) return;
+    speakersByTrack.forEach((entry, trackId) => {
+      if (!entry.analyser) return;
+      entry.analyser.getFloatTimeDomainData(entry.samples);
+      let sum = 0;
+      for (let i = 0; i < entry.samples.length; i += 1) {
+        sum += entry.samples[i] * entry.samples[i];
+      }
+      const rms = Math.sqrt(sum / entry.samples.length);
+      if (!entry.active && rms >= SPEECH_ON_RMS) {
+        entry.active = true;
+        // Number speakers in the order they are first heard.
+        if (entry.speaker === null) entry.speaker = nextSpeaker++;
+        entry._openAt = audioNow();
+      } else if (entry.active && rms < SPEECH_OFF_RMS) {
+        closeSpeechWindow(entry, false);
+      }
+    });
+  }
+
+  function closeSpeechWindow(entry, force) {
+    if (!entry.active) return;
+    const closedAt = audioNow();
+    const startedAt = entry._openAt === null ? closedAt : entry._openAt;
+    entry.active = false;
+    entry._openAt = null;
+    const duration = closedAt - startedAt;
+    entry.speakingMs += duration * 1000;
+    if (force || duration >= MIN_WINDOW_SEC) {
+      activity.push({
+        speaker: entry.speaker,
+        startSec: round3(startedAt),
+        endSec: round3(closedAt),
+      });
+    }
+  }
+
+  function round3(value) {
+    return Math.round(value * 1000) / 1000;
   }
 
   function noteTrack(track) {
@@ -206,6 +314,7 @@
         }
       }, 200));
       rec.timers.push(setInterval(scanMediaElements, 1000));
+      rec.timers.push(setInterval(pollVoiceActivity, ACTIVITY_POLL_MS));
       rec.timers.push(setInterval(() => {
         if (ctx.state !== 'running') ctx.resume().catch(() => { });
       }, 1000));
@@ -224,12 +333,31 @@
     return rec.chunks.splice(0, rec.chunks.length);
   };
 
+  rec.drainActivity = function () {
+    return activity.splice(0, activity.length);
+  };
+
+  rec.speakers = function () {
+    // Only people who have actually spoken get a number. A track that has been
+    // connected but stayed silent is not a speaker yet.
+    return Array.from(speakersByTrack.values()).filter((entry) => entry.speaker !== null)
+      .map((entry) => ({
+        speaker: entry.speaker,
+        speakingMs: Math.round(entry.speakingMs),
+        active: !!entry.active,
+        firstSeenSec: entry.firstSeenSec,
+      })).sort((a, b) => a.speaker - b.speaker);
+  };
+
   rec.stop = function () {
     if (!rec.started || rec.stopping) return false;
     rec.stopping = true;
     rec.timers.forEach(clearInterval);
     rec.timers = [];
     flushBytes();
+    // Close any window still open, so the last speaker of the call is not lost
+    // just because they were still talking when we stopped.
+    speakersByTrack.forEach((entry) => closeSpeechWindow(entry, true));
     rec.finished = true;
     try {
       const graph = rec.graph;
@@ -260,6 +388,9 @@
       seconds: rec.started ? (Date.now() - rec.startedAt) / 1000 : 0,
       sources: rec.graph ? rec.graph.sources.size : 0,
       tracksSeen: remoteTracks.size,
+      speakers: rec.speakers().length,
+      speakerCount: nextSpeaker - 1,
+      audioSeconds: audioNow(),
     };
   };
 })();

@@ -262,6 +262,101 @@ def test_sarvam_closed_detection():
     check("no ws counts as closed", sarvam_is_closed(SarvamStream(None, "realtime")) is True)
 
 
+
+
+def test_speaker_attribution():
+    print("[7] Speaker numbering, attribution, and deferred resolution")
+    from utils.speaker_registry import SpeakerRegistry
+    from utils.transcript_manager import TranscriptManager
+
+    reg = SpeakerRegistry()
+    reg.add_windows([{"speaker": 1, "startSec": 0.0, "endSec": 2.0}])
+    reg.add_windows([
+        {"speaker": 2, "startSec": 2.0, "endSec": 4.0},
+        {"speaker": 1, "startSec": 4.0, "endSec": 5.2},
+    ])
+    check("two distinct speakers counted", reg.count == 2, reg.count)
+    check("first speaker's turn", reg.resolve(0.0, 2.0) == 1)
+    check("second speaker's turn", reg.resolve(2.0, 4.0) == 2)
+    check("first speaker returns later", reg.resolve(4.0, 5.0) == 1)
+    # Overlapping audio: the longer overlap must win the utterance.
+    check("cross-talk goes to dominant speaker", reg.resolve(1.0, 3.5) == 2)
+    # Silence produces no guess at all rather than inventing a speaker.
+    check("silent window is unattributed", reg.resolve(99.0, 100.0) is None)
+    check("label formatting", reg.label(3) == "Speaker 3")
+    check("speakers sorted by first voice",
+          [s["speaker"] for s in reg.speakers()] == [1, 2])
+
+    # Pauses inside one sentence must not split a speaker into many turns.
+    merged = SpeakerRegistry()
+    merged.add_windows([
+        {"speaker": 4, "startSec": 0.0, "endSec": 1.0},
+        {"speaker": 4, "startSec": 1.3, "endSec": 2.0},
+    ])
+    check("adjacent windows merged", merged.speakers()[0]["turns"] == 1)
+    check("merged speaking time", merged.speakers()[0]["speaking_ms"] == 2000)
+
+    # A browser hiccup must not corrupt or crash the registry.
+    merged.add_windows([
+        {"speaker": "x", "startSec": None, "endSec": 3},
+        None,
+        {"speaker": 9, "startSec": 5, "endSec": 5},
+    ])
+    check("malformed windows skipped", merged.count == 1, merged.count)
+
+    # Real path: segments are labelled and counted in the manager.
+    mgr = TranscriptManager("speakers", started_at=time.time() - 30)
+    mgr.feed_activity([{"speaker": 1, "startSec": 1.0, "endSec": 3.0}])
+    seg = mgr.on_final("My weight is seventy", 1.2, 2.8)
+    check("segment labelled", seg["speaker_label"] == "Speaker 1", seg)
+    mgr.feed_activity([{"speaker": 2, "startSec": 4.0, "endSec": 6.0}])
+    seg2 = mgr.on_final("I am the nutritionist", 4.1, 5.9)
+    check("second speaker labelled", seg2["speaker_label"] == "Speaker 2", seg2)
+    check("speaker count exposed", mgr.snapshot()["speaker_count"] == 2)
+    check("speaker list exposed", len(mgr.snapshot()["speakers"]) == 2)
+    check("display uses numbered labels",
+          "Speaker 1:" in mgr.to_display_transcript()
+          and "Speaker 2:" in mgr.to_display_transcript())
+
+    # The transcript can beat the voice activity it depends on. Attribution has
+    # to be retried, not decided once and lost.
+    late = TranscriptManager("late", started_at=time.time() - 30)
+    orphan = late.on_final("I take metformin", 10.0, 12.0)
+    check("unknown speaker before activity", orphan["speaker_label"] == "Speaker")
+    late.feed_activity([{"speaker": 5, "startSec": 9.5, "endSec": 12.5}])
+    updates = late.drain_speaker_updates()
+    check("late attribution queued", len(updates) == 1 and updates[0]["speaker"] == 5)
+    check("queue drained once", late.drain_speaker_updates() == [])
+    check("segment patched in place", late.segments[0]["speaker_label"] == "Speaker 5")
+
+    # With attribution off, nothing should be added to the transcript shape.
+    plain = TranscriptManager("plain", started_at=time.time(), speaker_attribution=False)
+    plain.on_final("No labels here", 1.0, 2.0)
+    check("attribution can be disabled",
+          "speaker" not in plain.snapshot()["segments"][0])
+
+
+
+def test_speaker_relay_messages():
+    print("[9] Audio relay carries speaker activity alongside the audio")
+    from utils.audio_recorder import _speakers_message, _audio_message
+
+    payload = json.loads(_speakers_message([
+        {"speaker": 1, "startSec": 0.5, "endSec": 1.75},
+    ]))
+    check("speakers event name", payload["event"] == "speakers")
+    check("windows forwarded verbatim",
+          payload["windows"] == [{"speaker": 1, "startSec": 0.5, "endSec": 1.75}])
+    check("audio event unchanged", json.loads(_audio_message("AAA"))["event"] == "audio")
+
+    # The page is drained for audio and activity in one round-trip, so a poll
+    # can never fall between the two and misalign them.
+    from utils.audio_recorder import DRAIN_SCRIPT
+    check("drain is a single round-trip",
+          "drain()" in DRAIN_SCRIPT and "drainActivity()" in DRAIN_SCRIPT
+          and DRAIN_SCRIPT.count("return") == 1)
+
+
 if __name__ == "__main__":
     print("Running offline self-test\n")
     test_recorder_messages()
@@ -272,6 +367,8 @@ if __name__ == "__main__":
     test_storage()
     test_server_endpoints()
     test_sarvam_closed_detection()
+    test_speaker_attribution()
+    test_speaker_relay_messages()
     print(f"\n{PASS.__len__()} passed, {len(FAIL)} failed")
     if FAIL:
         sys.exit(1)

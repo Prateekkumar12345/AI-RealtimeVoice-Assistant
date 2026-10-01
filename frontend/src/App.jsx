@@ -19,6 +19,34 @@ function fmtTime(t) {
   return `${h}:${m}:${s}`;
 }
 
+// One colour per speaker, so the eye can follow a conversation without relying
+// on the number alone. Kept muted to sit with the rest of the panel.
+const SPEAKER_COLORS = [
+  "#2563eb", "#db2777", "#059669", "#d97706", "#7c3aed",
+  "#0891b2", "#be123c", "#4d7c0f", "#c026d3", "#ea580c",
+];
+
+function speakerColor(speaker) {
+  if (!speaker) return "#9ca3af";
+  return SPEAKER_COLORS[(speaker - 1) % SPEAKER_COLORS.length];
+}
+
+function SpeakerTag({ speaker, label }) {
+  const text = label || (speaker ? `Speaker ${speaker}` : "Speaker");
+  return (
+    <b
+      style={{
+        fontSize: 12,
+        color: speaker ? speakerColor(speaker) : "#9ca3af",
+        marginRight: 6,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {text}:
+    </b>
+  );
+}
+
 export default function App() {
   const [config, setConfig] = useState(null);
   const [meetingUrl, setMeetingUrl] = useState("");
@@ -27,6 +55,8 @@ export default function App() {
   const [error, setError] = useState(null);
   const [partial, setPartial] = useState("");
   const [segments, setSegments] = useState([]);
+  const [speakers, setSpeakers] = useState([]);
+  const [partialSpeaker, setPartialSpeaker] = useState(null);
   const [fields, setFields] = useState([]);
   const [wsState, setWsState] = useState("closed");
   const [sessions, setSessions] = useState([]);
@@ -69,6 +99,10 @@ export default function App() {
     setSegments(snap.segments || []);
     setFields(snap.fields || []);
     setError(snap.error || null);
+    setSpeakers(snap.speakers || []);
+    setPartialSpeaker(
+      snap.current_speaker ? `Speaker ${snap.current_speaker}` : null
+    );
   };
 
   const connect = (sid) => {
@@ -103,10 +137,30 @@ export default function App() {
           break;
         case "partial":
           setPartial(msg.text);
+          setPartialSpeaker(msg.speaker ? `Speaker ${msg.speaker}` : null);
           break;
         case "final":
           setSegments((prev) => [...prev, msg]);
           setPartial("");
+          setPartialSpeaker(null);
+          break;
+        case "speaker":
+          // The transcript for this line arrived before we knew who was
+          // talking; the server fills the label in once the voice activity for
+          // that moment turns up. Match on the line's own start time and text
+          // rather than "the last one", since other lines can land in between.
+          setSegments((prev) => {
+            const target = prev.findIndex(
+              (seg) => seg.text === msg.text && seg.start === msg.start
+            );
+            if (target < 0) return prev;
+            const next = [...prev];
+            next[target] = { ...next[target], speaker: msg.speaker, speaker_label: msg.speaker_label };
+            return next;
+          });
+          break;
+        case "speakers":
+          setSpeakers(msg.speakers || []);
           break;
         case "fields":
           setFields((prev) => {
@@ -164,6 +218,8 @@ export default function App() {
       setPartial("");
       setFields([]);
       setAudioWarning(null);
+      setSpeakers([]);
+      setPartialSpeaker(null);
       connect(data.session_id);
     } catch (e) {
       setError(`Could not reach the server: ${e}`);
@@ -229,6 +285,19 @@ export default function App() {
             />
             <b>{status}</b>
             {sessionId && <span style={{ color: "#6b7280", fontSize: 12 }}>session {sessionId}</span>}
+            {speakers.length > 0 && (
+              <span
+                style={{
+                  fontSize: 12, color: "#374151", background: "#f3f4f6",
+                  border: "1px solid #e5e7eb", borderRadius: 999, padding: "2px 10px",
+                }}
+                title={speakers
+                  .map((s) => `${s.label}: ${Math.round((s.speaking_ms || 0) / 1000)}s of speech`)
+                  .join("\n")}
+              >
+                {speakers.length} speaker{speakers.length === 1 ? "" : "s"}
+              </span>
+            )}
             <span style={{ marginLeft: "auto", fontSize: 12 }}>
               ws: {reconnecting ? "reconnecting…" : wsState}
             </span>
@@ -263,6 +332,9 @@ export default function App() {
 
           {partial && (
             <div style={{ background: "#fefce8", border: "1px solid #fde047", padding: "10px 14px", borderRadius: 8, marginBottom: 12, fontStyle: "italic", color: "#713f12" }}>
+              {partialSpeaker ? (
+                <b style={{ marginRight: 6, fontStyle: "normal" }}>{partialSpeaker}: </b>
+              ) : null}
               {partial}
             </div>
           )}
@@ -276,6 +348,7 @@ export default function App() {
                 <span style={{ color: "#6b7280", fontSize: 12, marginRight: 8 }}>
                   [{seg.start !== null && seg.start !== undefined ? fmtTime(seg.start) : index + 1}]
                 </span>
+                <SpeakerTag speaker={seg.speaker} label={seg.speaker_label} />
                 <span>{seg.text}</span>
               </div>
             ))}

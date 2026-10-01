@@ -149,6 +149,16 @@ AUDIO_WS_URL = os.getenv(
 ).strip()
 
 # ---------------------------------------------------------------------------
+# Speaker attribution ("who spoke?")
+# ---------------------------------------------------------------------------
+# Meet mixes every participant into one stream, so speaker numbers are derived
+# from per-participant voice activity (see utils/speaker_registry.py) rather
+# than by sending a separate speech-to-text stream per person.
+SPEAKER_ATTRIBUTION = str(os.getenv("SPEAKER_ATTRIBUTION", "true")).strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# ---------------------------------------------------------------------------
 # LLM field extraction (form filling)
 # ---------------------------------------------------------------------------
 # Provider precedence: LLM_PROVIDER=sarvam (default) reuses the existing
